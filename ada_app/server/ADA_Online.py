@@ -11,30 +11,37 @@ import googlemaps
 from datetime import datetime 
 import os
 from dotenv import load_dotenv
-import websockets
-import json
+# import websockets # Removed, no longer used for TTS
+import json # Keep for potential Gemini tool/response usage
 from googlesearch import search as Google_Search_sync
 import aiohttp # For async HTTP requests
 from bs4 import BeautifulSoup # For HTML parsing
 
 load_dotenv()
 
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-MAPS_API_KEY = os.getenv("MAPS_API_KEY") 
+MAPS_API_KEY = os.getenv("MAPS_API_KEY")
 
-if not ELEVENLABS_API_KEY: print("Error: ELEVENLABS_API_KEY not found.")
+# --- Gemini Configuration ---
+GEMINI_LLM_MODEL = os.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash-latest")
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-1.5-flash-preview-tts")
+GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "echo") # Default, ensure this is a valid voice
+
 if not GOOGLE_API_KEY: print("Error: GOOGLE_API_KEY not found.")
 if not MAPS_API_KEY: print("Error: MAPS_API_KEY not found.")
 
+# Print Gemini Config and warnings if defaults are used
+if not os.getenv("GEMINI_LLM_MODEL"): print("Warning: GEMINI_LLM_MODEL not found, using default.")
+print(f"Using Gemini LLM Model: {GEMINI_LLM_MODEL}")
+if not os.getenv("GEMINI_TTS_MODEL"): print("Warning: GEMINI_TTS_MODEL not found, using default.")
+print(f"Using Gemini TTS Model: {GEMINI_TTS_MODEL}")
+if not os.getenv("GEMINI_TTS_VOICE"): print("Warning: GEMINI_TTS_VOICE not found, using default.")
+print(f"Using Gemini TTS Voice: {GEMINI_TTS_VOICE}")
 
-VOICE_ID = 'pFZP5JQG7iQjIQuC4Bku'
 CHANNELS = 1
-RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE = 1024
-MAX_QUEUE_SIZE = 1
-
-MODEL_ID = "eleven_flash_v2_5" # Example model - check latest recommended models
+RECEIVE_SAMPLE_RATE = 24000 # Gemini TTS typically outputs at 24kHz
+CHUNK_SIZE = 1024 # Keep for other audio processing if any, not directly for Gemini non-streaming
+MAX_QUEUE_SIZE = 1 # Relates to response_queue or audio_output_queue, not directly Gemini
 
 class ADA:
     def __init__(self, socketio_instance=None, client_sid=None):
@@ -113,7 +120,7 @@ class ADA:
         )
 
         self.client = genai.Client(api_key=GOOGLE_API_KEY)
-        self.model = "gemini-2.0-flash" # Or your chosen model
+        self.model = GEMINI_LLM_MODEL # Use the loaded environment variable
         self.chat = self.client.aio.chats.create(model=self.model, config=self.config)
 
         # Queues and tasks
@@ -524,56 +531,76 @@ class ADA:
             self.gemini_session = None # Assuming this was meant to be self.chat? Or track session state elsewhere.
 
     async def run_tts_and_audio_out(self):
-        print("Starting TTS and Audio Output manager...")
-        uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream-input?model_id=eleven_flash_v2_5&output_format=pcm_24000"
+        print("Starting Gemini TTS and Audio Output manager...")
         while True:
             try:
-                async with websockets.connect(uri) as websocket:
-                    self.tts_websocket = websocket
-                    print("ElevenLabs WebSocket Connected.")
-                    await websocket.send(json.dumps({"text": " ", "voice_settings": {"stability": 0.3, "similarity_boost": 0.9, "speed": 1.1}, "xi_api_key": ELEVENLABS_API_KEY,}))
-                    async def tts_listener():
-                        try:
-                            while True:
-                                message = await websocket.recv()
-                                data = json.loads(message)
-                                if data.get("audio"):
-                                    audio_chunk = base64.b64decode(data["audio"])
-                                    if self.socketio and self.client_sid:
-                                        self.socketio.emit('receive_audio_chunk', {'audio': base64.b64encode(audio_chunk).decode('utf-8')}, room=self.client_sid)
-                                elif data.get('isFinal'): pass
-                        except websockets.exceptions.ConnectionClosedOK: print("TTS WebSocket listener closed normally.")
-                        except websockets.exceptions.ConnectionClosedError as e: print(f"TTS WebSocket listener closed error: {e}")
-                        except asyncio.CancelledError: print("TTS listener task cancelled.")
-                        except Exception as e: print(f"Error in TTS listener: {e}")
-                        finally: self.tts_websocket = None
-                    listener_task = asyncio.create_task(tts_listener())
-                    try:
-                        while True:
-                            text_chunk = await self.response_queue.get()
-                            if text_chunk is None:
-                                print("End of text stream signal received for TTS.")
-                                await websocket.send(json.dumps({"text": ""}))
-                                break
-                            await websocket.send(json.dumps({"text": text_chunk}))
-                            print(f"Sent text to TTS: {text_chunk}")
-                            #self.response_queue.task_done()
-                    except asyncio.CancelledError: print("TTS sender task cancelled.")
-                    except Exception as e: print(f"Error sending text to TTS: {e}")
-                    finally:
-                        if listener_task and not listener_task.done():
-                            try:
-                                if not listener_task.cancelled(): await asyncio.wait_for(listener_task, timeout=5.0)
-                            except asyncio.TimeoutError: print("Timeout waiting for TTS listener.")
-                            except asyncio.CancelledError: print("TTS listener task already cancelled.")
-            except websockets.exceptions.ConnectionClosedError as e: print(f"ElevenLabs WebSocket connection error: {e}. Reconnecting..."); await asyncio.sleep(5)
-            except asyncio.CancelledError: print("TTS main task cancelled."); break
-            except Exception as e: print(f"Error in TTS main loop: {e}"); await asyncio.sleep(5)
+                accumulated_text = ""
+                while True:
+                    text_chunk = await self.response_queue.get()
+                    if text_chunk is None: # Sentinel for end of a complete response
+                        self.response_queue.task_done()
+                        break
+                    accumulated_text += text_chunk
+                    self.response_queue.task_done()
+
+                if not accumulated_text.strip():
+                    print("TTS: No text to speak for this turn.")
+                    continue
+
+                print(f"TTS: Generating audio for: '{accumulated_text[:60]}...'")
+                try:
+                    tts_generation_config = types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=GEMINI_TTS_VOICE)
+                            )
+                        )
+                    )
+
+                    # Use asyncio.to_thread for the synchronous SDK call
+                    # Assuming self.client is the synchronous genai.Client
+                    response = await asyncio.to_thread(
+                        self.client.generate_content, # Synchronous client method
+                        model=GEMINI_TTS_MODEL,
+                        contents=[accumulated_text], # Contents should be an iterable
+                        generation_config=tts_generation_config,
+                        # stream=False is implied for generate_content unless stream=True
+                    )
+
+                    if response.candidates and response.candidates[0].content.parts:
+                        audio_chunk_bytes = response.candidates[0].content.parts[0].inline_data.data
+                        if audio_chunk_bytes:
+                            print(f"TTS: Received audio data ({len(audio_chunk_bytes)} bytes). Emitting via SocketIO.")
+                            if self.socketio and self.client_sid:
+                                self.socketio.emit('receive_audio_chunk',
+                                                   {'audio': base64.b64encode(audio_chunk_bytes).decode('utf-8')},
+                                                   room=self.client_sid)
+                        else:
+                            print("TTS: No audio data in response part.")
+                    else:
+                        print("TTS: Invalid response structure or no audio data from Gemini.")
+                        # Potentially emit an error or a silent chunk to the client
+                        if self.socketio and self.client_sid:
+                            self.socketio.emit('tts_error', {'message': 'TTS generation failed or no audio data.'}, room=self.client_sid)
+
+                except Exception as e:
+                    print(f"Error during Gemini TTS API call: {e}")
+                    if self.socketio and self.client_sid:
+                        self.socketio.emit('tts_error', {'message': f'TTS API Error: {str(e)}'}, room=self.client_sid)
+
+            except asyncio.CancelledError:
+                print("TTS and Audio Output manager task cancelled.")
+                break
+            except Exception as e:
+                print(f"Error in TTS and Audio Output manager: {e}")
+                if self.socketio and self.client_sid: # Notify client of an unexpected error
+                    self.socketio.emit('tts_error', {'message': f'Unexpected error in TTS: {str(e)}'}, room=self.client_sid)
+                await asyncio.sleep(1) # Avoid busy-looping on unexpected errors
             finally:
-                 if self.tts_websocket:
-                     try: await self.tts_websocket.close()
-                     except Exception: pass
-                 self.tts_websocket = None
+                # Ensure any pending SocketIO operations are flushed if possible, though usually handled by emit.
+                # No websocket to close here anymore.
+                pass
 
     async def start_all_tasks(self):
         print("Starting ADA background tasks...")
@@ -597,9 +624,6 @@ class ADA:
             if task and not task.done(): task.cancel()
         await asyncio.gather(*[t for t in tasks_to_cancel if t], return_exceptions=True)
         self.tasks = []
-        if self.tts_websocket:
-            try: await self.tts_websocket.close(code=1000)
-            except Exception as e: print(f"Error closing TTS websocket during stop: {e}")
-            finally: self.tts_websocket = None
-        self.gemini_session = None
+        # Removed tts_websocket cleanup as it's no longer used
+        self.gemini_session = None # This was self.chat in __init__, ensure consistency if it's meant to clear the chat session object
         print("ADA tasks stopped.")

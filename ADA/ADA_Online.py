@@ -1,7 +1,7 @@
 import asyncio
-import websockets
-import json
-import base64
+# import websockets # Removed
+import json # Still used by Gemini responses/tools potentially
+# import base64 # Removed
 import pyaudio
 from RealtimeSTT import AudioToTextRecorder
 import torch  # Import the torch library
@@ -18,22 +18,31 @@ from dotenv import load_dotenv # Added for API key loading
 
 # --- Load Environment Variables ---
 load_dotenv()
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 MAPS_API_KEY = os.getenv("MAPS_API_KEY") # Added Maps API Key
 
+# --- Gemini Configuration ---
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-1.5-flash-preview-tts")
+GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "echo") # Using a common voice name, adjust if needed
+GEMINI_LLM_MODEL = os.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash-latest")
+
 # --- Validate API Keys ---
-if not ELEVENLABS_API_KEY: print("Error: ELEVENLABS_API_KEY not found in environment variables.")
 if not GOOGLE_API_KEY: print("Error: GOOGLE_API_KEY not found in environment variables.")
 if not MAPS_API_KEY: print("Error: MAPS_API_KEY not found in environment variables.")
-# --- End API Key Validation ---
 
-VOICE_ID = 'pFZP5JQG7iQjIQuC4Bku'
+# --- Print Gemini Config ---
+if not os.getenv("GEMINI_TTS_MODEL"): print("Warning: GEMINI_TTS_MODEL not found, using default.")
+if not os.getenv("GEMINI_TTS_VOICE"): print("Warning: GEMINI_TTS_VOICE not found, using default.")
+if not os.getenv("GEMINI_LLM_MODEL"): print("Warning: GEMINI_LLM_MODEL not found, using default.")
+print(f"Using Gemini TTS Model: {GEMINI_TTS_MODEL}")
+print(f"Using Gemini TTS Voice: {GEMINI_TTS_VOICE}")
+print(f"Using Gemini LLM Model: {GEMINI_LLM_MODEL}")
+# --- End API Key Validation ---
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 # SEND_SAMPLE_RATE = 16000 # Keep if used by RealtimeSTT or other input processing
-RECEIVE_SAMPLE_RATE = 24000 # For ElevenLabs output
+RECEIVE_SAMPLE_RATE = 24000 # For Gemini TTS output (24kHz)
 CHUNK_SIZE = 1024
 
 class ADA:
@@ -50,7 +59,7 @@ class ADA:
 
         # --- Initialize Google GenAI Client ---
         self.client = genai.Client(api_key=GOOGLE_API_KEY, http_options={'api_version': 'v1beta'})
-        self.model = "gemini-2.0-flash-live-001"
+        self.model = GEMINI_LLM_MODEL # Use the loaded environment variable
 
         # --- System Behavior Prompt (Updated from reference) ---
         self.system_behavior = """
@@ -340,108 +349,83 @@ class ADA:
             # No specific cleanup needed here unless tasks were managed differently
 
     async def tts(self):
-        """ Send text to ElevenLabs API and stream the returned audio. (Kept Original Logic)"""
-        uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream-input?model_id=eleven_flash_v2_5&output_format=pcm_24000"
-        while True: # Outer loop to handle reconnections
-            print("Attempting to connect to ElevenLabs WebSocket...")
+        """Generates audio from text using Gemini TTS and puts it on the audio_queue."""
+        print("Starting Gemini TTS task...")
+        while True:
             try:
-                async with websockets.connect(uri) as websocket:
-                    print("ElevenLabs WebSocket Connected.")
-                    try:
-                        # Send initial configuration
-                        await websocket.send(json.dumps({
-                            "text": " ",
-                            "voice_settings": {"stability": 0.4, "similarity_boost": 0.8, "speed": 1.1},
-                            "xi_api_key": ELEVENLABS_API_KEY,
-                        }))
+                text_to_speak = ""
+                # Accumulate text from the response_queue until None is received
+                while True:
+                    chunk = await self.response_queue.get()
+                    if chunk is None: # End of current text stream
+                        self.response_queue.task_done()
+                        break
+                    text_to_speak += chunk
+                    self.response_queue.task_done()
 
-                        async def listen():
-                            """Listen to the websocket for audio data and queue it."""
-                            while True:
-                                try:
-                                    message = await websocket.recv()
-                                    data = json.loads(message)
-                                    if data.get("audio"):
-                                        # Put raw audio bytes onto the queue
-                                        await self.audio_queue.put(base64.b64decode(data["audio"]))
-                                    elif data.get("isFinal"):
-                                        # Optional: Handle end-of-stream signal from ElevenLabs if needed
-                                        pass
-                                    # Removed `elif text is None:` check as it was incorrect scope
-                                except websockets.exceptions.ConnectionClosedOK:
-                                    print("ElevenLabs connection closed normally by server.")
-                                    break # Exit listener loop
-                                except websockets.exceptions.ConnectionClosedError as e:
-                                     print(f"ElevenLabs connection closed with error: {e}")
-                                     break # Exit listener loop
-                                except json.JSONDecodeError as e:
-                                    print(f"JSON Decode Error in ElevenLabs listener: {e}")
-                                    # Decide whether to break or continue
-                                except asyncio.CancelledError:
-                                     print("ElevenLabs listener task cancelled.")
-                                     raise # Re-raise cancellation
-                                except Exception as e:
-                                    print(f"Error in ElevenLabs listener: {e}")
-                                    break # Exit listener loop on other errors
+                if not text_to_speak.strip(): # If accumulated text is empty or just whitespace
+                    print("TTS: No text to speak for this turn.")
+                    continue # Wait for new text from response_queue
 
-                        listen_task = asyncio.create_task(listen())
+                print(f"TTS: Generating audio for: '{text_to_speak[:60]}...'")
 
-                        try:
-                            # Send text chunks from response queue
-                            while True:
-                                text = await self.response_queue.get()
-                                if text is None: # Signal to end the TTS stream for this turn
-                                    print("End of text stream signal received for TTS.")
-                                    await websocket.send(json.dumps({"text": ""})) # Send EOS signal
-                                    break # Exit inner loop (sending text)
+                try:
+                    tts_config = types.GenerateContentConfig(
+                        response_modalities=["AUDIO"], # Specify audio output
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                # For prebuilt voices, use PrebuiltVoiceConfig
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=GEMINI_TTS_VOICE)
+                                # For custom voices (if available and configured), use CustomVoiceConfig
+                                # custom_voice_config=types.CustomVoiceConfig(custom_voice=types.CustomVoice(name="your-custom-voice-name"))
+                            )
+                        )
+                    )
 
-                                if text: # Ensure text is not empty
-                                    # Added space for potential word breaks
-                                    await websocket.send(json.dumps({"text": text + " "}))
+                    # Using the synchronous client's generate_content method wrapped in to_thread
+                    # The model specified here (GEMINI_TTS_MODEL) should be a TTS-capable model.
+                    response = await asyncio.to_thread(
+                        self.client.generate_content, # Using the main synchronous client
+                        model=GEMINI_TTS_MODEL,       # e.g., "gemini-1.5-flash-preview-tts"
+                        contents=[text_to_speak],     # Text to be synthesized
+                        generation_config=tts_config
+                        # stream=True # If stream=True, response is an iterable of GenerateContentResponse
+                                      # and each part's data needs to be collected.
+                                      # For non-streaming, it's a single GenerateContentResponse.
+                    )
 
-                                self.response_queue.task_done() # Mark item as processed
+                    # Process non-streaming response
+                    if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                        # Ensure the part is audio data
+                        if response.candidates[0].content.parts[0].inline_data and response.candidates[0].content.parts[0].inline_data.data:
+                            audio_data = response.candidates[0].content.parts[0].inline_data.data
+                            if audio_data:
+                                print(f"TTS: Received audio data ({len(audio_data)} bytes). Putting on queue.")
+                                await self.audio_queue.put(audio_data)
+                            else:
+                                print("TTS: No audio data in the first part of the response.")
+                        else:
+                            print("TTS: First part of the response does not contain inline audio data.")
+                            # You might want to log the part structure here for debugging
+                            # print(f"TTS: Part structure: {response.candidates[0].content.parts[0]}")
+                    else:
+                        print("TTS: Invalid response structure, no candidates, content, or parts found.")
+                        # Log the full response for debugging if necessary
+                        # print(f"TTS: Full response: {response}")
 
-                        except asyncio.CancelledError:
-                            print("TTS text sender cancelled.")
-                            listen_task.cancel() # Cancel listener if sender is cancelled
-                            raise # Re-raise cancellation
-                        except Exception as e:
-                            print(f"Error processing text for TTS: {e}")
-                            listen_task.cancel() # Cancel listener on error
-                        finally:
-                            # Wait for the listener task to finish after text sending stops or errors
-                            if not listen_task.done():
-                                print("Waiting for TTS listener task to complete...")
-                                try:
-                                    await asyncio.wait_for(listen_task, timeout=5.0)
-                                except asyncio.TimeoutError:
-                                    print("Timeout waiting for TTS listener task.")
-                                    listen_task.cancel()
-                                except asyncio.CancelledError:
-                                     print("TTS Listener was already cancelled.") # Expected if sender was cancelled
-                                except Exception as e:
-                                     print(f"Error awaiting listener task: {e}")
+                except Exception as e:
+                    print(f"Error during Gemini TTS API call: {e}")
+                    # Consider how to handle TTS errors, e.g., play a pre-recorded error sound
+                    # or put a special marker on the audio_queue.
+                    # For now, it just logs and the loop continues.
 
-
-                    except websockets.exceptions.ConnectionClosed as e:
-                         print(f"ElevenLabs WebSocket connection closed during operation: {e}")
-                         # Outer loop will handle reconnection attempt
-                    except Exception as e:
-                        print(f"Error during ElevenLabs websocket communication: {e}")
-                        # Outer loop will handle reconnection attempt
-
-            except websockets.exceptions.WebSocketException as e:
-                print(f"ElevenLabs WebSocket connection failed: {e}")
             except asyncio.CancelledError:
-                 print("TTS main task cancelled.")
-                 break # Exit outer loop if cancelled
+                print("TTS task cancelled.")
+                break # Exit the main while loop
             except Exception as e:
-                print(f"Error connecting to ElevenLabs websocket: {e}")
-
-            print("Waiting 5 seconds before attempting ElevenLabs reconnection...")
-            await asyncio.sleep(5) # Wait before retrying connection
-
-    # Removed extract_tool_call method as it's replaced by direct handling in send_prompt
+                print(f"Outer error in TTS loop: {e}")
+                # Adding a small delay to prevent busy-looping on persistent errors
+                await asyncio.sleep(1)
 
     async def play_audio(self):
         """ Plays audio chunks from the audio_queue. (Kept Original Logic) """
@@ -528,7 +512,7 @@ async def main():
     tasks = [
         asyncio.create_task(ada.stt()),          # Speech to Text -> input_queue
         asyncio.create_task(ada.send_prompt()),  # input_queue -> Gemini (handles tools) -> response_queue
-        asyncio.create_task(ada.tts()),          # response_queue -> ElevenLabs -> audio_queue
+        asyncio.create_task(ada.tts()),          # response_queue -> Gemini TTS -> audio_queue
         asyncio.create_task(ada.play_audio()),   # audio_queue -> Speaker
         # asyncio.create_task(ada.input_message()) # Optional: Uncomment for text input instead of STT
     ]
